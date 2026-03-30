@@ -1,0 +1,201 @@
+#include <ESP8266WiFi.h>
+#include <ThingSpeak.h>
+#include <DHT.h>
+#include <math.h>
+
+// ========== PIN DEFINITIONS ==========
+#define DHTPIN D1           // GPIO5 - DHT22 data pin
+#define DHTTYPE DHT22       // DHT sensor type
+#define MQ135_PIN A0        // Analog pin for MQ-135
+#define PM25_PIN D2         // GPIO4 - DSM501A PM2.5 output
+#define PM10_PIN D6         // GPIO12 - DSM501A PM10 output (stable)
+#define BUZZER_PIN D5       // GPIO14 - Buzzer
+
+// ========== WiFi CREDENTIALS ==========
+const char* ssid = "";
+const char* password = "";
+
+// ========== THINGSPEAK SETUP ==========
+unsigned long channelID = ;    // Your Channel ID
+const char* writeAPIKey = ""; // Your Write API Key
+
+// ========== SENSOR OBJECTS ==========
+DHT dht(DHTPIN, DHTTYPE);
+WiFiClient client;
+
+// ========== DSM501A VARIABLES ==========
+unsigned long duration25, duration10, starttime;
+unsigned long sampletime_ms = 60000;  // 60 seconds
+unsigned long lowpulse25 = 0, lowpulse10 = 0;
+float ratio25 = 0, ratio10 = 0;
+float pm25_concentration = 0, pm10_concentration = 0;
+
+// ========== THRESHOLD VALUES ==========
+const int AIR_QUALITY_THRESHOLD = 150;
+const float PM25_THRESHOLD = 35.0;   // WHO guideline
+const float PM10_THRESHOLD = 150.0;  // WHO guideline
+
+// ========== SMOOTHING FUNCTION ==========
+float smooth(float prev, float current, float alpha = 0.3) {
+  return alpha * current + (1 - alpha) * prev;
+}
+
+// ========== HELPER FUNCTIONS ==========
+float calc_low_ratio(unsigned long lowPulse, unsigned long sampleTime) {
+  return (float)lowPulse / (float)sampleTime * 100.0;
+}
+
+// Calibrated DSM501A conversion formula (more accurate)
+float calc_concentration_mgm3(float lowRatio) {
+  float c_mgm3 = 0.00039 * pow(lowRatio, 2) + 0.031 * lowRatio + 0.2;
+  return max(0.0f, c_mgm3);
+}
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("\n\n=================================");
+  Serial.println("Air Quality Monitor - Calibrated");
+  Serial.println("DSM501A + DHT22 + MQ135 + ThingSpeak");
+  Serial.println("=================================\n");
+
+  pinMode(PM25_PIN, INPUT);
+  pinMode(PM10_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  dht.begin();
+
+  // WiFi Connection
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  ThingSpeak.begin(client);
+
+  Serial.println("Warming up DSM501A sensor for 1 minute...");
+  delay(60000);
+  Serial.println("System Ready!\n");
+}
+
+void loop() {
+  Serial.println("Sampling PM2.5 and PM10 for 60 seconds...");
+  lowpulse25 = 0;
+  lowpulse10 = 0;
+  starttime = millis();
+
+  while ((millis() - starttime) < sampletime_ms) {
+    duration25 = pulseIn(PM25_PIN, LOW);
+    lowpulse25 += duration25;
+
+    duration10 = pulseIn(PM10_PIN, LOW);
+    lowpulse10 += duration10;
+  }
+
+  ratio25 = calc_low_ratio(lowpulse25, sampletime_ms * 1000);
+  ratio10 = calc_low_ratio(lowpulse10, sampletime_ms * 1000);
+  float new_pm25 = calc_concentration_mgm3(ratio25) * 1000;
+  float new_pm10 = calc_concentration_mgm3(ratio10) * 1000;
+
+  pm25_concentration = smooth(pm25_concentration, new_pm25);
+  pm10_concentration = smooth(pm10_concentration, new_pm10);
+
+  pm25_concentration *= 0.3;
+  pm10_concentration *= 0.3;
+
+  // MQ-135 Air Quality
+  int airQuality = analogRead(MQ135_PIN);
+
+  // DHT22 with retry
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  int retries = 0;
+  while ((isnan(humidity) || isnan(temperature)) && retries < 3) {
+    Serial.println("DHT22 read failed, retrying...");
+    delay(2000);
+    humidity = dht.readHumidity();
+    temperature = dht.readTemperature();
+    retries++;
+  }
+  if (isnan(humidity) || isnan(temperature)) {
+    humidity = 0;
+    temperature = 0;
+    Serial.println("⚠️ DHT22 failed after retries");
+  }
+
+  Serial.println("\n--- Sensor Readings ---");
+  Serial.printf("Air Quality (MQ-135): %d\n", airQuality);
+  Serial.printf("Temperature: %.2f °C\n", temperature);
+  Serial.printf("Humidity: %.2f %%\n", humidity);
+  Serial.printf("PM2.5: %.2f µg/m³\n", pm25_concentration);
+  Serial.printf("PM10: %.2f µg/m³\n", pm10_concentration);
+
+  Serial.println("\n--- Air Quality Status ---");
+  if (pm25_concentration <= 12.0) Serial.println("PM2.5: Good");
+  else if (pm25_concentration <= 35.0) Serial.println("PM2.5: Moderate");
+  else if (pm25_concentration <= 55.0) Serial.println("PM2.5: Unhealthy (Sensitive)");
+  else Serial.println("PM2.5: Unhealthy");
+
+  if (pm10_concentration <= 54.0) Serial.println("PM10: Good");
+  else if (pm10_concentration <= 154.0) Serial.println("PM10: Moderate");
+  else if (pm10_concentration <= 254.0) Serial.println("PM10: Unhealthy (Sensitive)");
+  else Serial.println("PM10: Unhealthy");
+
+  // ===== ALERTS and BUZZER LOGIC =====
+  bool buzzerAlert = false;
+
+  if (airQuality > AIR_QUALITY_THRESHOLD) {
+    Serial.println("⚠️ Poor air quality detected by MQ-135!");
+    buzzerAlert = true;
+  }
+  if (pm25_concentration > PM25_THRESHOLD) {
+    Serial.println("⚠️ High PM2.5 levels!");
+    buzzerAlert = true;
+  }
+  if (pm10_concentration > PM10_THRESHOLD) {
+    Serial.println("⚠️ High PM10 levels!");
+    buzzerAlert = true;
+  }
+  if (temperature == 0 && humidity == 0) {
+    Serial.println("⚠️ DHT-22 sensor issue!");
+    // Optional: add buzzer for sensor issue if desired
+  }
+
+  if (temperature >= 50.0) {
+    Serial.println("⚠️ High temperature detected (>= 70°C)!");
+    buzzerAlert = true;
+  }
+  // ==== TEMPERATURE exceeds 70°C ====
+
+  if (buzzerAlert) {
+    // Buzzer sounds for MQ135 and all PM alerts
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(200);
+    }
+  }
+
+  Serial.println("\nUploading to ThingSpeak...");
+
+  ThingSpeak.setField(1, airQuality);
+  ThingSpeak.setField(2, temperature);
+  ThingSpeak.setField(3, humidity);
+  ThingSpeak.setField(4, pm25_concentration);
+  ThingSpeak.setField(5, pm10_concentration);
+
+  int responseCode = ThingSpeak.writeFields(channelID, writeAPIKey);
+  if (responseCode == 200)
+    Serial.println("✓ Data uploaded successfully!");
+  else {
+    Serial.print("✗ Upload failed. Error code: ");
+    Serial.println(responseCode);
+  }
+
+  Serial.println("\n=================================\n");
+  delay(20000); // Wait 20s before next reading
+}
